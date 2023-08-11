@@ -1,3 +1,4 @@
+import GPUtil
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torchtext.data.functional import to_map_style_dataset
@@ -710,6 +711,7 @@ def load_vocab(spacy_de, spacy_en):
         f"Vocabulary Size: len(src)={len(vocab_src)}, len(tgt)={len(vocab_tgt)}")
     return vocab_src, vocab_tgt
 
+
 spacy_de, spacy_en = load_tokenizers()
 vocab_src, vocab_tgt = load_vocab(spacy_de, spacy_en)
 # print(vocab_src["<s>"], vocab_src["</s>"])
@@ -832,9 +834,9 @@ def create_dataloaders(
 
     return train_dataloader, valid_dataloader
 
-import GPUtil
+
 def train_worker(
-        gpu,
+        gpu,  # -1 CPU
         ngpus_per_node,
         vocab_src,
         vocab_tgt,
@@ -867,7 +869,6 @@ def train_worker(
         max_padding=config["max_padding"],
         is_distributed=is_distributed
     )
-
 
     optimizer = torch.optim.Adam(
         model.parameters(), lr=config["base_lr"], betas=(0.9, 0.98), eps=1e-9
@@ -925,14 +926,15 @@ def train_worker(
 
 
 def train_model(vocab_src, vocab_tgt, spacy_de, spacy_en, config):
-    train_worker(0, 1, vocab_src, vocab_tgt, spacy_de, spacy_en, config, False)
+    train_worker(-1, 1, vocab_src, vocab_tgt,
+                 spacy_de, spacy_en, config, False)
 
 
 def load_trained_model():
     config = {
         "batch_size": 32,
         "distributed": False,
-        "num_epochs":8,
+        "num_epochs": 8,
         "accum_iter": 10,
         "base_lr": 1.0,
         "max_padding": 72,
@@ -946,5 +948,6 @@ def load_trained_model():
 
     model = make_model(len(vocab_src), len(vocab_tgt), N=6)
     model.load_state_dict(torch.load("multi30k_model_final.pt"))
+
 
 model = load_trained_model()
