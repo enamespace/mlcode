@@ -1,3 +1,13 @@
+from pathlib import Path
+from tqdm.auto import tqdm
+from PIL import Image
+from torch.optim import Adam
+from torch.utils.data import DataLoader
+from torchvision import transforms
+from datasets import load_dataset
+import numpy as np
+from torchvision.transforms import Compose, ToTensor, Lambda, ToPILImage, CenterCrop, Resize
+import requests
 import math
 from inspect import isfunction
 from functools import partial
@@ -33,13 +43,13 @@ class Residual(nn.Module):
         super().__init__()
         self.fn = fn
 
-    def forward(self, x, *args, **kwargs):
-        return self.fn(x, *args, **kwargs) + x
+    def forward(self, x):
+        return self.fn(x) + x
 
 
 def Upsample(dim, dim_out=None):
     return nn.Sequential(
-        nn.Upsample(scale_factor=2, mode="nearset"),
+        nn.Upsample(scale_factor=2, mode="nearest"),
         nn.Conv2d(dim, default(dim_out, dim), 3, padding=1)
     )
 
@@ -119,7 +129,7 @@ class ResnetBlock(nn.Module):
         )
 
         self.block1 = Block(dim, dim_out, groups=groups)
-        self.block2 = Block(dim, dim_out, groups=groups)
+        self.block2 = Block(dim_out, dim_out, groups=groups)
         self.res_conv = nn.Conv2d(
             dim, dim_out, 1) if dim != dim_out else nn.Identity()
 
@@ -218,8 +228,8 @@ class PreNorm(nn.Module):
 class Unet(nn.Module):
     def __init__(self,
                  dim,
-                 init_dim,
-                 out_dim,
+                 init_dim=None,
+                 out_dim=None,
                  dim_mults=(1, 2, 4, 8),
                  channels=3,
                  self_condition=False,  # 什麼是self_condition
@@ -240,7 +250,7 @@ class Unet(nn.Module):
         dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
         in_out = list(zip(dims[:-1], dims[1:]))
 
-        block_klass = partial(ResnetBlock, groups=num_to_groups)
+        block_klass = partial(ResnetBlock, groups=resnet_block_groups)
 
         time_dim = dim * 4
 
@@ -329,10 +339,10 @@ class Unet(nn.Module):
             x = downsample(x)
 
         x = self.mid_block1(x, t)
-        x = self.mid_attn(x, t)
+        x = self.mid_attn(x)
         x = self.mid_block2(x, t)
 
-        for block1, block2, attn, upsample, in self.ups:
+        for block1, block2, attn, upsample in self.ups:
             x = torch.cat((x, h.pop()), dim=1)
             x = block1(x, t)
 
@@ -350,8 +360,6 @@ class Unet(nn.Module):
         return self.final_conv(x)
 
 
-
-
 def cosine_beta_schedule(timesteps, s=0.008):
     """
     cosine schedule as proposed in https://arxiv.org/abs/2102.09672
@@ -359,10 +367,11 @@ def cosine_beta_schedule(timesteps, s=0.008):
 
     steps = timesteps + 1
     x = torch.linspace(0, timesteps, steps)
-    alphas_cumprod = torch.cos(((x/timesteps) + s) / (1+s) * torch.pi * 0.5) ** 2
+    alphas_cumprod = torch.cos(
+        ((x/timesteps) + s) / (1+s) * torch.pi * 0.5) ** 2
     alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
 
-    betas = 1 - (alphas_cumprod[1:]/ alphas_cumprod[:-1])
+    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
 
     return torch.clip(betas, 0.0001, 0.9999)
 
@@ -371,6 +380,7 @@ def linear_beta_schedule(timesteps):
     beta_start = 0.0001
     beta_end = 0.02
     return torch.linspace(beta_start, beta_end, timesteps)
+
 
 def quadratic_beta_schedule(timesteps):
     beta_start = 0.0001
@@ -403,39 +413,35 @@ sqrt_one_minus_alphas_cumprod = torch.sqrt(1. - alphas_cumprod)
 posterior_variance = betas * (1. - alphas_cumprod_prev) / (1 - alphas_cumprod)
 
 # 存疑
+
+
 def extract(a, t, x_shape):
     batch_size = t.shape[0]
     out = a.gather(-1, t.cpu())
     return out.reshape(batch_size, *((1, ) * (len(x_shape)-1))).to(t.device)
 
-from PIL import Image
-import requests
 
 # url = 'http://images.cocodataset.org/val2017/000000039769.jpg'
 # image = Image.open(requests.get(url, stream=True).raw) # PIL image of shape HWC
 # image
 
-from torchvision.transforms import Compose, ToTensor, Lambda, ToPILImage, CenterCrop, Resize
+# image_size = 128
 
-image_size = 128
 
-transform = Compose([
-    Resize(image_size),
-    CenterCrop(image_size),
-    ToTensor(),
-    Lambda(lambda t: (t*2)-1) # [-1, 1]
-])
+# transform = Compose([
+#     Resize(image_size),
+#     CenterCrop(image_size),
+#     ToTensor(),
+#     Lambda(lambda t: (t*2)-1)  # [-1, 1]
+# ])
 
 # x_start = transform(image).unsqueeze(0)
 # x_start.shape
 
 
-
-import numpy as np
-
 reverse_transform = Compose([
     Lambda(lambda t: (t+1)/2),
-    Lambda(lambda t: t.permute(1,2,0)),
+    Lambda(lambda t: t.permute(1, 2, 0)),
     Lambda(lambda t: t * 255.),
     Lambda(lambda t: t.numpy().astype(np.uint8)),
     ToPILImage()
@@ -447,28 +453,31 @@ reverse_transform = Compose([
 def q_sample(x_start, t, noise=None):
     noise = default(noise, torch.rand_like(x_start))
     sqrt_alphas_cumprod_t = extract(sqrt_alphas_cumprod, t, x_start.shape)
-    sqrt_one_minus_alphas_cumprod_t = extract(sqrt_one_minus_alphas_cumprod, t, x_start.shape)
+    sqrt_one_minus_alphas_cumprod_t = extract(
+        sqrt_one_minus_alphas_cumprod, t, x_start.shape)
 
     return sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
 
+
 def get_noisy_image(x_start, t):
-  # add noise
-  x_noisy = q_sample(x_start, t=t)
+    # add noise
+    x_noisy = q_sample(x_start, t=t)
 
-  # turn back into PIL image
-  noisy_image = reverse_transform(x_noisy.squeeze())
+    # turn back into PIL image
+    noisy_image = reverse_transform(x_noisy.squeeze())
 
-  return noisy_image
+    return noisy_image
 
 # # take time step
 # t = torch.tensor([40])
 
 # get_noisy_image(x_start, t)
 
+
 def p_losses(denoise_model, x_start, t, noise=None, loss_type="l1"):
     if noise is None:
         noise = torch.rand_like(x_start)
-    
+
     x_noisy = q_sample(x_start=x_start, t=t, noise=noise)
     predicted_noise = denoise_model(x_noisy, t)
 
@@ -480,19 +489,15 @@ def p_losses(denoise_model, x_start, t, noise=None, loss_type="l1"):
         loss = F.smooth_l1_loss(noise, predicted_noise)
     else:
         raise NotImplementedError()
-    
+
     return loss
 
-
-from datasets import load_dataset
 
 dataset = load_dataset('fashion_mnist')
 image_size = 28
 channels = 1
 batch_size = 128
 
-from torchvision import transforms
-from torch.utils.data import DataLoader
 
 transform = Compose([
     transforms.RandomHorizontalFlip(),
@@ -502,13 +507,129 @@ transform = Compose([
 
 
 def transforms(examples):
-    examples['pixel_values'] = [transform(image.convert('L')) for image in examples['image']]
-    del examples["images"]
+    examples['pixel_values'] = [
+        transform(image.convert('L')) for image in examples['image']]
+    del examples["image"]
 
     return examples
 
-transformed_dateset = dataset.with_transform(transforms).remove_columns("label")
 
-dataloader = DataLoader(transformed_dateset['train'], batch_size=batch_size, shuffle=True)
+transformed_dateset = dataset.with_transform(
+    transforms).remove_columns("label")
+
+dataloader = DataLoader(
+    transformed_dateset['train'], batch_size=batch_size, shuffle=True)
 
 # Sampling
+
+
+@torch.no_grad()
+def p_sample(model, x, t, t_index):
+    betas_t = extract(betas, t, x.shape)
+    sqrt_one_minus_alphas_cumprod_t = extract(
+        sqrt_one_minus_alphas_cumprod, t, x.shape
+    )
+
+    sqrt_recip_alphas_t = extract(sqrt_recip_alphas, t, x.shape)
+
+    model_mean = sqrt_recip_alphas_t * \
+        (x - betas_t * model(x, t) / sqrt_one_minus_alphas_cumprod_t)
+
+    if t_index == 0:
+        return model_mean
+    else:
+        posterior_variance_t = extract(posterior_variance, t, x.shape)
+        noise = torch.rand_like(x)
+        return model_mean + torch.sqrt(posterior_variance_t) * noise
+
+
+@torch.no_grad()
+def p_sample_loop(model, shape):
+    device = next(model.parameters()).device
+
+    b = shape[0]
+
+    img = torch.randn(shape, device=device)
+
+    imgs = []
+
+    for i in tqdm(reversed(range(0, timesteps)), desc="sampling loop time step", total=timesteps):
+        img = p_sample(model, img, torch.full(
+            (b,), i, device=device, dtype=torch.long), i)
+        imgs.append(img.cpu().numpy())
+
+    return imgs
+
+
+@torch.no_grad()
+def sample(model, image_size, batch_size=16, channels=3):
+    return p_sample_loop(model, shape=(batch_size, channels, image_size, image_size))
+
+
+result_folder = Path("./results")
+result_folder.mkdir(exist_ok=True)
+save_and_sample_every = 1000
+
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+model = Unet(
+    dim=image_size,
+    channels=channels,
+    dim_mults=(1, 2, 4)
+)
+
+model.to(device)
+from torchvision.utils import save_image
+optimizer = Adam(model.parameters(), lr=1e-3)
+
+epochs = 6
+
+for epoch in range(epochs):
+    for step, batch in enumerate(dataloader):
+        optimizer.zero_grad()
+        batch_size = batch['pixel_values'].shape[0]
+        batch = batch['pixel_values'].to(device)
+        t = torch.randint(0, timesteps, (batch_size, ), device=device).long()
+        loss = p_losses(model, batch, t, loss_type="huber")
+        
+        if step % 100 == 0:
+            print("Loss: ", loss.item())
+
+        loss.backward()
+        optimizer.step()
+
+        if step != 0 and step % save_and_sample_every == 0:
+            milestone = step // save_and_sample_every
+            batches = num_to_groups(4, batch_size)
+            all_images_list=list(map(lambda n: sample(model, batch_size=n, channels=channels), batches))
+            all_images = torch.cat(all_images_list, dim=0)
+            all_images = (all_images + 1) * 0.5
+            save_image(all_images, str(result_folder / f'sample-{milestone}.png'), nrow = 6)
+
+
+
+# sampling(inference)
+samples = sample(model, image_size=image_size, batch_size=64, channels=channels)
+
+random_index = 5
+
+import matplotlib.pyplot as plt
+plt.imshow(samples[-1][random_index].reshape(image_size, image_size, channels), cmap="gray")
+
+
+import matplotlib.animation as animation
+
+random_index = 53
+
+fig = plt.figure()
+ims = []
+for i in range(timesteps):
+    im = plt.imshow(samples[i][random_index].reshape(image_size, image_size, channels), cmap="gray", animated=True)
+    ims.append([im])
+
+animate = animation.ArtistAnimation(fig, ims, interval=50, blit=True, repeat_delay=1000)
+animate.save('diffusion.gif')
+plt.show()
+
+
