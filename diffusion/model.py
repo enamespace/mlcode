@@ -605,7 +605,9 @@ for epoch in range(epochs):
             all_images_list=list(map(lambda n: sample(model, batch_size=n, channels=channels), batches))
             all_images = torch.cat(all_images_list, dim=0)
             all_images = (all_images + 1) * 0.5
-            save_image(all_images, str(result_folder / f'sample-{milestone}.png'), nrow = 6)
+            image_name = f'sample-{milestone}.png'
+            print("image_name: ", image_name)
+            save_image(all_images, str(result_folder / image_name ), nrow = 6)
 
 
 
